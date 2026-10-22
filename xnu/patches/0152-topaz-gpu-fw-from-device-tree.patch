@@ -1,0 +1,47 @@
+diff --git a/iokit/Kernel/arm/TopazGpu.cpp b/iokit/Kernel/arm/TopazGpu.cpp
+index 95cb057..bb203dc 100755
+--- a/iokit/Kernel/arm/TopazGpu.cpp
++++ b/iokit/Kernel/arm/TopazGpu.cpp
+@@ -27,6 +27,7 @@
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IORegistryEntry.h>
+ #include <IOKit/IODeviceTreeSupport.h>
++#include <pexpert/device_tree.h>
+ #include <kern/thread.h>
+ #include <libkern/c++/OSData.h>
+ #include <pexpert/pexpert.h>
+@@ -263,19 +264,33 @@ scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t
+ 
+ /* ---------------------------------------------------------------- firmware from the device tree */
+ 
++/* the boot device tree itself first (pexpert), the IORegistry's copy of it second */
+ static OSData *
+ fw(const char *name)
+ {
+-	IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/gpu", gIODTPlane);
++	DTEntry entry;
++	void const *prop = NULL;
++	unsigned int size = 0;
+ 	OSData *d = NULL;
+ 
++	if (SecureDTLookupEntry(NULL, "/arm-io/gpu", &entry) == kSuccess &&
++	    SecureDTGetProperty(entry, name, &prop, &size) == kSuccess && size != 0) {
++		LOG("  firmware %s: %u bytes (device tree)", name, size);
++		return OSData::withBytes(prop, size);
++	}
++	IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/gpu", gIODTPlane);
+ 	if (node != NULL) {
+ 		d = OSDynamicCast(OSData, node->getProperty(name));
+ 		if (d != NULL) {
+ 			d->retain();
++			LOG("  firmware %s: %u bytes (registry)", name, d->getLength());
+ 		}
+ 		node->release();
+ 	}
++	if (d == NULL) {
++		LOG("  firmware %s: not found (/arm-io/gpu %s in the device tree)", name,
++		    SecureDTLookupEntry(NULL, "/arm-io/gpu", &entry) == kSuccess ? "is" : "is NOT");
++	}
+ 	return d;
+ }
+ 
