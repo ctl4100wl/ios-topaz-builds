@@ -1,0 +1,144 @@
+diff --git a/iokit/Kernel/arm/TopazGpu.cpp b/iokit/Kernel/arm/TopazGpu.cpp
+index 40a5a30..95cb057 100755
+--- a/iokit/Kernel/arm/TopazGpu.cpp
++++ b/iokit/Kernel/arm/TopazGpu.cpp
+@@ -489,6 +489,129 @@ hw_init_regs(void)
+ 	gwr(0xe19, 0x81);                               /* UCHE_CLIENT_PF */
+ }
+ 
++/* ---------------------------------------------------------------- 2D engine (G1.5) */
++
++/*
++ * A solid fill with the 2D engine, as Mesa's freedreno does it for a6xx (fd6_blitter.cc:
++ * emit_setup, emit_clear_color, emit_blit_setup, emit_blit_buffer_dst, emit_blit_fini; register
++ * offsets from registers/adreno/a6xx.xml, a610 values from common/freedreno_devices.py).
++ * Format 8_8_8_8 UNORM, linear, WZYX: byte i of a pixel is SOLID_C<i>.
++ */
++#define PKT4(reg, cnt)  (0x40000000u | (cnt) | (par(cnt) << 7) | (((reg) & 0x3ffff) << 8) | (par(reg) << 27))
++#define CP_EVENT_WRITE      0x46
++#define CP_WAIT_FOR_IDLE    0x26
++#define CP_BLIT             0x2c
++#define EV_CACHE_FLUSH_TS   4
++#define EV_CCU_INV_DEPTH    24
++#define EV_CCU_INV_COLOR    25
++#define EV_CCU_FLUSH_DEPTH_TS 28
++#define EV_CCU_FLUSH_COLOR_TS 29
++#define EV_LABEL            63
++#define FMT6_8888           0x30
++#define R2D_UNORM8          0x10
++
++static uint32_t seqno;
++
++static void
++event(uint32_t ev, bool ts, uint64_t ts_pa)
++{
++	emit(pkt7(CP_EVENT_WRITE, ts ? 4 : 1));
++	emit(ev | (ts ? (1u << 30) : 0));
++	if (ts) {
++		emit((uint32_t)ts_pa);
++		emit((uint32_t)(ts_pa >> 32));
++		emit(++seqno);
++	}
++}
++
++static inline void
++reg(uint32_t r, uint32_t v)
++{
++	emit(PKT4(r, 1));
++	emit(v);
++}
++
++/* fill w x h pixels at dst_pa (pitch in bytes, a multiple of 64) with one BGRA colour */
++static void
++emit_fill(uint64_t dst_pa, uint32_t pitch, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t bgra, uint64_t ts_pa)
++{
++	uint32_t blit_cntl = (0xfu << 20) | (FMT6_8888 << 8) | (R2D_UNORM8 << 24) | (1u << 7);  /* SOLID_COLOR */
++
++	/* emit_setup: clean + invalidate the CCU, then bypass mode (sysmem: depth 0, colour at 8 KB) */
++	event(EV_CCU_FLUSH_COLOR_TS, true, ts_pa);
++	event(EV_CCU_FLUSH_DEPTH_TS, true, ts_pa);
++	event(EV_CCU_INV_COLOR, false, 0);
++	event(EV_CCU_INV_DEPTH, false, 0);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	reg(0x8e07, 1u | ((0x2000u >> 12) << 23));      /* RB_CCU_CNTL: no gmem fast clear, colour offset 8 KB */
++	/* emit_clear_color */
++	emit(PKT4(0x8c2c, 4));                          /* RB_2D_SRC_SOLID_C0..C3 */
++	emit(bgra & 0xff);
++	emit((bgra >> 8) & 0xff);
++	emit((bgra >> 16) & 0xff);
++	emit((bgra >> 24) & 0xff);
++	/* emit_blit_setup */
++	reg(0x8c00, blit_cntl);                         /* RB_2D_BLIT_CNTL */
++	reg(0x8400, blit_cntl);                         /* GRAS_2D_BLIT_CNTL */
++	reg(0xacc0, (FMT6_8888 << 3) | (0xfu << 12));   /* SP_2D_DST_FORMAT */
++	reg(0x8c01, 0);                                 /* RB_2D_UNKNOWN_8C01 */
++	/* the destination */
++	emit(PKT4(0x8c17, 4));                          /* RB_2D_DST_INFO, RB_2D_DST lo/hi, RB_2D_DST_PITCH */
++	emit(FMT6_8888);                                /* linear, WZYX */
++	emit((uint32_t)dst_pa);
++	emit((uint32_t)(dst_pa >> 32));
++	emit(pitch >> 6);
++	emit(PKT4(0x8405, 2));                          /* GRAS_2D_DST_TL, GRAS_2D_DST_BR */
++	emit(x | (y << 16));
++	emit((x + w - 1) | ((y + h - 1) << 16));
++	/* emit_blit_fini */
++	event(EV_LABEL, false, 0);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	reg(0x8e04, 0x04100000);                        /* RB_DBG_ECO_CNTL: a610 blit value */
++	emit(pkt7(CP_BLIT, 1));
++	emit(3);                                        /* BLIT_OP_SCALE */
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++	reg(0x8e04, 0);
++	/* make it visible to the CPU */
++	event(EV_CCU_FLUSH_COLOR_TS, true, ts_pa);
++	event(EV_CACHE_FLUSH_TS, true, ts_pa);
++	emit(pkt7(CP_WAIT_FOR_IDLE, 0));
++}
++
++/* 64 x 32 pixels: a red rectangle at (8,4) 32 x 16 in a field the CPU set to grey */
++static void
++fill_test(uint64_t pa, uint32_t *va, uint64_t ts_pa)
++{
++	const uint32_t W = 64, H = 32, pitch = W * 4;
++	unsigned in = 0, out = 0;
++
++	LOG("--- 2D fill");
++	for (uint32_t i = 0; i < W * H; i++) {
++		va[i] = 0xff808080;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	emit_fill(pa, pitch, 8, 4, 32, 16, 0xffff0000, ts_pa);   /* BGRA bytes 00 00 ff ff: red, opaque */
++	if (!submit("2D fill", 200)) {
++		return;
++	}
++	IODelay(100);
++	for (uint32_t y = 0; y < H; y++) {
++		for (uint32_t x = 0; x < W; x++) {
++			bool inside = x >= 8 && x < 40 && y >= 4 && y < 20;
++			uint32_t want = inside ? 0xffff0000 : 0xff808080;
++			if (va[y * W + x] == want) {
++				inside ? in++ : out++;
++			}
++		}
++	}
++	LOG("  pixels right: %u of 512 inside, %u of 1536 outside; (8,4) %08x (0,0) %08x (39,19) %08x (40,20) %08x",
++	    in, out, va[4 * W + 8], va[0], va[19 * W + 39], va[20 * W + 40]);
++	if (in == 512 && out == 1536) {
++		LOG("  *** THE GPU DREW A RECTANGLE (2D engine) ***");
++	}
++	smmu_fault("after fill");
++}
++
+ static void
+ cp_start(void)
+ {
+@@ -548,6 +671,9 @@ cp_start(void)
+ 	IODelay(100);
+ 	LOG("  test buffer: %08x %s", test[0], test[0] == 0xC0FFEE00 ? "*** THE GPU WROTE TO MEMORY ***" : "(not written)");
+ 	smmu_fault("after test");
++	if (test[0] == 0xC0FFEE00) {
++		fill_test(test_pa + 0x1000, (uint32_t *)((uint8_t *)test + 0x1000), test_pa + 0x40);
++	}
+ stop:
+ 	gwr(0x808, 0);                                  /* CP_SQE_CNTL: stop */
+ out:
