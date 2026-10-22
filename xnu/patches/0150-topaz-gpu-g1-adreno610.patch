@@ -20,10 +20,10 @@ index fc1a540..dcd97e1 100644
  	fWidth = (uint32_t)video.v_width;
 diff --git a/iokit/Kernel/arm/TopazGpu.cpp b/iokit/Kernel/arm/TopazGpu.cpp
 new file mode 100755
-index 0000000..f815016
+index 0000000..40a5a30
 --- /dev/null
 +++ b/iokit/Kernel/arm/TopazGpu.cpp
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,610 @@
 +/*
 + * topaz: Adreno 610 bring-up, stage G1 (boot-arg gpu_g1=1). A port of topaz-woa's TopazGpu v0.6
 + * (MakrSas/topaz-woa, drivers/TopazGpu/driver.c; docs/P8_gpu.md), which reached this point under
@@ -52,6 +52,7 @@ index 0000000..f815016
 +#include <IOKit/IOBufferMemoryDescriptor.h>
 +#include <IOKit/IOMemoryDescriptor.h>
 +#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
 +#include <kern/thread.h>
 +#include <libkern/c++/OSData.h>
 +#include <pexpert/pexpert.h>
