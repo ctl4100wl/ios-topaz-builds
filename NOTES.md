@@ -1,3 +1,31 @@
+## Verified clean GPU build; USB transfer blocked — 2026-10-22
+
+- IMPORTANT CORRECTION: copied BUILD makefiles/dependencies used the old /home
+  source. Earlier 0964/0965 binary did not include those patches. Prior notes
+  claiming the Wi-Fi fix was booted are incorrect. Moved copied BUILD aside,
+  rebuilt from /tmp/topaz-gpu-fix-xnu locally (build target), exit 0.
+- Checked .cpd paths point to patched temp source, binary contains Wi-Fi restart
+  and GPU/SURFACE trace strings, AppleCLCD::publishModes symbol and screen reserve
+  message. Disassembly of topaz_gpu_pool_alloc confirms midmem early return.
+  No undefined kernel symbols; boot v4/payload/ADT and ARMv8 scans pass.
+- Added upstream MakrSas 0948/0949 display modes and guarded surface reserve,
+  local 0966 bounded optional GPU/SURFACE externalMethod entry/exit tracing.
+- Ready images (NOT successfully booted): boot-files/shim-boot-3g-0966-wifi-gpu.img
+  sha256 655bc01bf7d60bc4e8f2f9b29364eff2acfe176d7201a97c5062664b84a0aac4;
+  shim-boot-3g-0966-gpu-liveconsole.img sha256
+  0b763e86ed19d5214c6547f8c1b5bc1b73ff1eb5a82f0b8f88ca1b7910d47b28.
+  Console variant uses sweetfb_console=1, omits sweetfb_noconsole=1, keeps GPU.
+  Console variant intentionally holds panel text, so cannot assess GUI visually.
+- Latest temporary liveconsole boot failed at transfer with Windows timeout 121;
+  no Booting OKAY. Log research/logs/boot-0966-liveconsole.log. User screenshot
+  and PnP properties now confirm OPLUS oem6.inf WinUSB active (earlier Google
+  binding changed). This differs from previous driver evidence; not proven sole
+  cause of descriptor failures. Google package oem73.inf remains installed;
+  copied signed package to C:\iOS Build\google-usb-driver for manual selection.
+- User wants live console and hardware GPU, local WSL builds only. Userdata v3
+  untouched, no PC reboot. Await corrected USB binding then temporary boot.
+- New tools/check-xnu-source.py rejects stale translation-unit dependencies.
+
 ## USB blocks requested GPU restoration — 2026-10-22
 
 - User repeatedly authorized loading the full GPU image; userdata remains v3 and

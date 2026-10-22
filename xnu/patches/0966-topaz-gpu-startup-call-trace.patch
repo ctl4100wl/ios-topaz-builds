@@ -1,0 +1,75 @@
+Subject: [PATCH] topaz: bounded opt-in GPU and IOSurface startup call tracing
+
+Entry/exit markers distinguish a stalled operation from an unrelated last log
+line. Enabled only with gpu_startup_trace=1; first 96 calls per interface.
+No request payloads or user memory are logged.
+
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -1216,10 +1216,31 @@
+ 	return ret;
+ }
+ 
++/* Opt-in bounded entry/exit markers: the last ordinary log line is not a backtrace. */
++class TopazGPUCallTrace {
++	unsigned selector;
++	bool enabled;
++public:
++	TopazGPUCallTrace(unsigned value) : selector(value), enabled(false) {
++		static unsigned calls;
++		uint32_t trace = 0;
++		enabled = PE_parse_boot_argn("gpu_startup_trace", &trace, sizeof(trace)) && trace != 0 && calls++ < 96;
++		if (enabled) {
++			IOLog("TOPAZ GPU call %u enter\n", selector);
++		}
++	}
++	~TopazGPUCallTrace() {
++		if (enabled) {
++			IOLog("TOPAZ GPU call %u leave\n", selector);
++		}
++	}
++};
++
+ IOReturn
+ RedwoodGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
+     IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
+ {
++	TopazGPUCallTrace trace(selector);
+ 	union {
+ 		struct msm_param param;
+ 		struct msm_gem_new gemNew;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1455,11 +1455,32 @@
+ 	return ret;
+ }
+ 
++/* Opt-in bounded entry/exit markers: the last ordinary log line is not a backtrace. */
++class TopazSurfaceCallTrace {
++	unsigned selector;
++	bool enabled;
++public:
++	TopazSurfaceCallTrace(unsigned value) : selector(value), enabled(false) {
++		static unsigned calls;
++		uint32_t trace = 0;
++		enabled = PE_parse_boot_argn("gpu_startup_trace", &trace, sizeof(trace)) && trace != 0 && calls++ < 96;
++		if (enabled) {
++			IOLog("TOPAZ SURFACE call %u enter\n", selector);
++		}
++	}
++	~TopazSurfaceCallTrace() {
++		if (enabled) {
++			IOLog("TOPAZ SURFACE call %u leave\n", selector);
++		}
++	}
++};
++
+ IOReturn
+ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+     __unused void *reference)
+ {
++	TopazSurfaceCallTrace trace(selector);
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
+ 
+ 	switch (selector) {
