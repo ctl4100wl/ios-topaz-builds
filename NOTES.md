@@ -1,3 +1,27 @@
+## Live deployment status — 2026-10-22
+
+- User explicitly authorized flashing v3 sparse userdata, then the GPU boot image.
+- Sparse verification PASSED: 17,179,869,184 expanded bytes; SHA-256
+  f0d2ed78a61dbf9eddc6118d13742e9eb19482f721c60f758ea9fc4a27941833.
+  Sparse SHA-256 be76ec7dbd89e70234caf89083a73590c3d859119564e395686ca50704c01648.
+  Reports/manifest in boot-files: sparse-verification-v3-gpu.json, SHA256SUMS-v3-gpu.txt.
+- Device identified in fastboot; userdata flash SUCCEEDED with -S 512M (24 chunks),
+  exit 0, total 300.276 seconds. All sends and writes returned OKAY.
+  Log: ios-topaz/research/logs/flash-v3-gpu.log. Temporary fastboot boot
+  shim-boot-3g-0965-wifi-gpu.img was then attempted (30-second timeout).
+  Boot log: ios-topaz/research/logs/boot-v3-gpu-0965.log. First boot timed out
+  at Sending (exit 124); no retry was attempted until the user confirmed manually
+  returning to fastboot. Retry log: boot-v3-gpu-0965-retry.log. If ABL hangs, user must manually
+  re-enter fastboot (Power+VolDown); do not retry against a hung transfer.
+- Retry SUCCEEDED after the user re-entered fastboot: Sending 0.390 s,
+  Booting 0.324 s, finished 0.723 s, exit 0. This is a TEMPORARY RAM boot;
+  boot/recovery partitions were not flashed. User currently reports "Still booting".
+  Do not claim iOS/UI, hardware rendering or Wi-Fi connectivity verified yet.
+- Source commits (local only): ios-topaz 1741704; ios-topaz-fork 0ac6faf.
+- Approval to flash is explicit. Fresh raw reserved console-ring reads remain
+  unapproved after automatic review rejection; flashing approval is not approval
+  for that separate read. Do not bypass it.
+
 ## WSL Wi-Fi/GPU work — 2026-10-22 (Codex)
 
 - User explicitly requested **local WSL builds**, no GitHub Actions. Inspected live
@@ -41,8 +65,8 @@
   musl loader + busybox for mount/umount: host mount is setuid to uid 65534 in
   this sandbox. `research/guest/job-v3-gpu.sh` and `run-v3-gpu.sh` retain recipe.
   Guest exit 0, HFS+ check after install clean, boot-critical root checks pass.
-- Raw output `boot-files/ios16-root-v3-gpu.img`; Android sparse packaging started,
-  followed by required independent expansion/hash verification before flashing.
+- Raw output `boot-files/ios16-root-v3-gpu.img`; sparse packaging and independent
+  expansion/hash verification PASSED (see deployment status above).
 - No phone partitions written or temporary boot attempted. Phone was seen in
   recovery. Fresh raw console-ring pull was rejected by automatic approval
   review as potentially containing userdata outside logs. Do NOT work around it:
