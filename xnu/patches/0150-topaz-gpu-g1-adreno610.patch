@@ -1,0 +1,647 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fc1a540..dcd97e1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -42,6 +42,7 @@ extern "C" void (*sweet_console_show_hook)(void);
+ extern "C" void topaz_modem_init(void);
+ extern "C" void sweet_busy_init(void);              /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */             /* iokit/Kernel/arm/TopazModem.cpp (boot-arg modem=1) */
+ extern "C" void sweet_network_stack_init(void);      /* iokit/Kernel/arm/SweetNetworkStack.cpp */
++extern "C" void topaz_gpu_init(void);                /* iokit/Kernel/arm/TopazGpu.cpp (boot-arg gpu_g1=1) */
+ extern "C" int sweet_console_copy_dirty(void *dst);
+ 
+ /*
+@@ -271,6 +272,7 @@ AppleCLCD::start(IOService *provider)
+ 	topaz_modem_init();
+ 	sweet_busy_init();
+ 	sweet_network_stack_init();
++	topaz_gpu_init();
+ 	PE_current_console(&video);
+ 	fPhys = video.v_baseAddr;
+ 	fWidth = (uint32_t)video.v_width;
+diff --git a/iokit/Kernel/arm/TopazGpu.cpp b/iokit/Kernel/arm/TopazGpu.cpp
+new file mode 100755
+index 0000000..f815016
+--- /dev/null
++++ b/iokit/Kernel/arm/TopazGpu.cpp
+@@ -0,0 +1,609 @@
++/*
++ * topaz: Adreno 610 bring-up, stage G1 (boot-arg gpu_g1=1). A port of topaz-woa's TopazGpu v0.6
++ * (MakrSas/topaz-woa, drivers/TopazGpu/driver.c; docs/P8_gpu.md), which reached this point under
++ * Windows on the same phone: the GPU executes commands and writes to memory.
++ *
++ * Steps, once, on a thread of its own 20 s after the framebuffer starts:
++ *   power up    GCC GPU clocks, CX GDSC, GPU CC cxo/ahb/gmu, GX GDSC, gfx3d at 300 MHz from GPLL0
++ *   first reads RBBM_STATUS, CP_ALWAYS_ON_COUNTER ticking at 19.2 MHz
++ *   zap         a610_zap through TrustZone PAS 13 into its reserved region 0x55B15000
++ *   SMMU        GPU SMMU context bank 0 as pass-through for SID 0 mask 1 (GPU VA = PA)
++ *   CP          hw_init subset, SQE microcode, 32 KB ring, CP_ME_INIT, CP_SET_SECURE_MODE 0,
++ *               CP_MEM_WRITE 0xC0FFEE00 into a page the CPU reads back
++ *   power down  everything again: nothing of the GPU outlives the test
++ *
++ * The firmware is the phone's own (Android vendor: /vendor/firmware/a610_zap.mdt + .b02,
++ * a630_sqe.fw); it is not in this repository. tools/mkadt*.py puts the files into the device
++ * tree of a locally built boot image (/arm-io/gpu: zap-mdt, zap-seg, sqe) and they are read here.
++ *
++ * A read of the GPU (0x5900000) or its SMMU with the GDSCs or clocks off hangs the bus: nothing
++ * there is touched before the power-up has reported PWR_ON and running clocks.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <IOKit/IORegistryEntry.h>
++#include <kern/thread.h>
++#include <libkern/c++/OSData.h>
++#include <pexpert/pexpert.h>
++
++#define LOG(fmt, ...) IOLog("TopazGpu: " fmt "\n", ##__VA_ARGS__)
++#ifndef MIN
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#endif
++#ifndef MAX
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#endif
++
++#define GCC_BASE            0x01400000ull
++#define GCC_SIZE            0x80000
++#define GPUCC_BASE          0x05990000ull
++#define GPUCC_SIZE          0x9000
++#define GPU_BASE            0x05900000ull
++#define GPU_SIZE            0x40000
++#define SMMU_BASE           0x059A0000ull
++#define SMMU_SIZE           0x10000
++#define ZAP_REGION          0x55B15000ull
++#define ZAP_REGION_SIZE     0x2000
++#define GPU_PAS_ID          13
++
++#define CBCR_EN             (1u << 0)
++#define CBCR_OFF            (1u << 31)
++#define GDSC_COLLAPSE       (1u << 0)
++#define GDSC_PWR_ON         (1u << 31)
++#define RCG_UPDATE          (1u << 0)
++#define SRC_GPLL0           5
++
++#define SCM_FN(svc, cmd)    (0x42000000u | ((uint32_t)(svc) << 8) | (uint32_t)(cmd))
++#define SCM_SVC_BOOT        0x01
++#define SCM_BOOT_SET_REMOTE_STATE 0x0a
++#define SCM_SVC_PIL         0x02
++#define PIL_INIT_IMAGE      0x01
++#define PIL_MEM_SETUP       0x02
++#define PIL_AUTH_RESET      0x05
++#define PIL_SHUTDOWN        0x06
++#define SCM_ARG_RW          2
++
++#define RB_BYTES            0x8000
++#define RB_DWORDS           (RB_BYTES / 4)
++#define CP_ME_INIT          0x48
++#define CP_SET_SECURE_MODE  0x66
++#define CP_MEM_WRITE        0x3d
++
++static IOMemoryMap *gcc_map, *gpucc_map, *gpu_map, *smmu_map;
++static volatile uint8_t *gcc, *gpucc, *gpu, *smmu;
++static IOBufferMemoryDescriptor *sqe_md, *ring_md, *test_md, *meta_md;
++static uint32_t *ring, *test;
++static uint32_t wptr;
++
++/* ---------------------------------------------------------------- registers */
++
++static inline uint32_t
++rd(volatile uint8_t *b, uint32_t off)
++{
++	return *(volatile uint32_t *)(b + off);
++}
++
++static inline void
++wr(volatile uint8_t *b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++}
++
++static inline void
++rmw(volatile uint8_t *b, uint32_t off, uint32_t clear, uint32_t set)
++{
++	wr(b, off, (rd(b, off) & ~clear) | set);
++}
++
++static bool
++poll(volatile uint8_t *b, uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	for (uint32_t i = 0; i <= us; i++) {
++		if ((rd(b, off) & mask) == want) {
++			return true;
++		}
++		IODelay(1);
++	}
++	return false;
++}
++
++static IOMemoryMap *
++map_regs(uint64_t pa, uint64_t size, volatile uint8_t **va)
++{
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, size, kIODirectionInOut);
++	IOMemoryMap *m = NULL;
++
++	if (md != NULL) {
++		m = md->map(kIOMapInhibitCache);
++		md->release();
++	}
++	*va = m != NULL ? (volatile uint8_t *)m->getVirtualAddress() : NULL;
++	return m;
++}
++
++/* ---------------------------------------------------------------- power */
++
++static bool
++branch_on(volatile uint8_t *b, uint32_t off, const char *name)
++{
++	rmw(b, off, 0, CBCR_EN);
++	bool ok = poll(b, off, CBCR_OFF, 0, 200);
++	LOG("  %-26s on: %08x %s", name, rd(b, off), ok ? "running" : "STILL OFF");
++	return ok;
++}
++
++static bool
++rcg_set(uint32_t cmd, uint32_t src, uint32_t div, const char *name)
++{
++	wr(gpucc, cmd + 4, (src << 8) | (2 * div - 1));
++	rmw(gpucc, cmd, 0, RCG_UPDATE);
++	bool ok = poll(gpucc, cmd, RCG_UPDATE, 0, 500);
++	LOG("  %-26s src %u div %u: cmd %08x cfg %08x %s", name, src, div, rd(gpucc, cmd), rd(gpucc, cmd + 4),
++	    ok ? "updated" : "UPDATE STUCK");
++	return ok;
++}
++
++/* gdsc.c gdsc_enable(): [pulse the BCR] [release the clamp] clear SW_COLLAPSE, poll PWR_ON */
++static bool
++gdsc_on(uint32_t gdscr, uint32_t bcr, uint32_t clamp, uint32_t status, const char *name)
++{
++	if (bcr != 0) {
++		rmw(gpucc, bcr, 0, 1);
++		IODelay(1);
++		rmw(gpucc, bcr, 1, 0);
++	}
++	if (clamp != 0) {
++		rmw(gpucc, clamp, 1, 0);
++	}
++	rmw(gpucc, gdscr, GDSC_COLLAPSE, 0);
++	IODelay(1);
++	bool ok = poll(gpucc, status, GDSC_PWR_ON, GDSC_PWR_ON, 500);
++	LOG("  %-26s on: gdscr %08x status %08x %s", name, rd(gpucc, gdscr), rd(gpucc, status), ok ? "PWR_ON" : "NO PWR_ON");
++	return ok;
++}
++
++static bool
++power_up(void)
++{
++	bool ok = true;
++
++	LOG("--- power up");
++	LOG("  as found: cx gdscr %08x gx gdscr %08x gfx3d %08x", rd(gpucc, 0x106c), rd(gpucc, 0x100c), rd(gpucc, 0x1054));
++	rmw(gcc, 0x79004, 0, 1u << 15);                 /* GPLL0 to the GPU CC */
++	LOG("  gcc vote 79004 = %08x", rd(gcc, 0x79004));
++	branch_on(gcc, 0x71154, "gcc_bimc_gpu_axi");
++	branch_on(gcc, 0x3600c, "gcc_gpu_memnoc_gfx");
++	branch_on(gcc, 0x36018, "gcc_gpu_snoc_dvm_gfx");
++	/* CX first: the GPU CC cxo/ahb branches live in it */
++	if (!gdsc_on(0x106c, 0, 0, 0x1540, "gpu_cx_gdsc")) {
++		return false;
++	}
++	ok &= branch_on(gpucc, 0x109c, "gpucc_cxo");
++	ok &= branch_on(gpucc, 0x1078, "gpucc_ahb");
++	if (!ok) {
++		return false;
++	}
++	rcg_set(0x1120, SRC_GPLL0, 3, "gmu_clk_src (200 MHz)");
++	rmw(gpucc, 0x1098, 0xFF0, 0xFF0);
++	branch_on(gpucc, 0x1098, "gpucc_cx_gmu");
++	branch_on(gpucc, 0x5000, "gpucc_hlos1_vote_gpu_smmu");
++	if (!gdsc_on(0x100c, 0x1008, 0x1508, 0x100c, "gpu_gx_gdsc")) {
++		return false;
++	}
++	ok &= rcg_set(0x101c, SRC_GPLL0, 2, "gx_gfx3d_clk_src (300 MHz)");
++	rmw(gpucc, 0x1054, 0, (1u << 14) | (1u << 13));
++	ok &= branch_on(gpucc, 0x1054, "gpucc_gx_gfx3d");
++	branch_on(gpucc, 0x1060, "gpucc_gx_cxo");
++	return ok;
++}
++
++static void
++power_down(void)
++{
++	LOG("--- power down");
++	rmw(gpucc, 0x1054, CBCR_EN, 0);
++	rmw(gpucc, 0x100c, 0, GDSC_COLLAPSE);
++	rmw(gpucc, 0x1508, 0, 1);
++	rmw(gpucc, 0x1098, CBCR_EN, 0);
++	rmw(gpucc, 0x5000, CBCR_EN, 0);
++	rmw(gpucc, 0x106c, 0, GDSC_COLLAPSE);
++	LOG("  gx gdscr %08x, cx gdscr %08x", rd(gpucc, 0x100c), rd(gpucc, 0x106c));
++}
++
++static void
++first_reads(void)
++{
++	LOG("--- first GPU reads");
++	LOG("  RBBM_STATUS %08x CP_HW_FAULT %08x", rd(gpu, 4 * 0x210), rd(gpu, 4 * 0x821));
++	uint32_t lo1 = rd(gpu, 4 * 0x980);
++	IOSleep(10);
++	uint32_t lo2 = rd(gpu, 4 * 0x980);
++	LOG("  CP_ALWAYS_ON_COUNTER delta %u in 10 ms (19.2 MHz = ~192000)", lo2 - lo1);
++}
++
++/* ---------------------------------------------------------------- TrustZone */
++
++static uint64_t
++smc(uint64_t a[8])
++{
++	register uint64_t x0 __asm__("x0") = a[0], x1 __asm__("x1") = a[1], x2 __asm__("x2") = a[2],
++	    x3 __asm__("x3") = a[3], x4 __asm__("x4") = a[4], x5 __asm__("x5") = a[5], x6 __asm__("x6") = a[6],
++	    x7 __asm__("x7") = a[7];
++	__asm__ volatile ("smc #0"
++            : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++            :
++            : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3; a[4] = x4; a[5] = x5; a[6] = x6; a[7] = x7;
++	return x0;
++}
++
++/* long calls return INTERRUPTED (1): resume with x0 = 1 and the session from x6 */
++static uint64_t
++scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1)
++{
++	uint64_t args[8] = { fn, arginfo, a, b, c, 0, 0, 0 };
++
++	smc(args);
++	for (unsigned n = 0; args[0] == 1 && n < 100000; n++) {
++		uint64_t again[8] = { 1, arginfo, a, b, c, 0, args[6], 0 };
++		memcpy(args, again, sizeof(args));
++		smc(args);
++	}
++	if (res1 != NULL) {
++		*res1 = args[1];
++	}
++	return args[0];
++}
++
++/* ---------------------------------------------------------------- firmware from the device tree */
++
++static OSData *
++fw(const char *name)
++{
++	IORegistryEntry *node = IORegistryEntry::fromPath("/arm-io/gpu", gIODTPlane);
++	OSData *d = NULL;
++
++	if (node != NULL) {
++		d = OSDynamicCast(OSData, node->getProperty(name));
++		if (d != NULL) {
++			d->retain();
++		}
++		node->release();
++	}
++	return d;
++}
++
++/* physically contiguous, uncached, below 0xF0000000 (TZ and the GPU read it by address) */
++static IOBufferMemoryDescriptor *
++dma_alloc(uint32_t bytes, uint64_t *pa, void **va)
++{
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapInhibitCache, bytes, 0x00000000EFFFF000ull);
++
++	if (md == NULL) {
++		return NULL;
++	}
++	*pa = md->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	*va = md->getBytesNoCopy();
++	bzero(*va, bytes);
++	return md;
++}
++
++/* qcom_mdt_load(): metadata = the whole .mdt, the one PT_LOAD segment into the region */
++static bool
++zap_load(void)
++{
++	OSData *mdt = fw("zap-mdt"), *seg = fw("zap-seg");
++	const uint8_t *m;
++	uint32_t msize, phoff, phnum, load = UINT32_MAX, lo = UINT32_MAX, hi = 0;
++	uint64_t st, res = 0, meta_pa;
++	void *meta;
++	bool ok = false;
++
++	LOG("--- zap shader (PAS %u)", GPU_PAS_ID);
++	if (mdt == NULL || seg == NULL || mdt->getLength() < 52) {
++		LOG("  /arm-io/gpu zap-mdt/zap-seg missing: no firmware in this boot image");
++		goto out;
++	}
++	m = (const uint8_t *)mdt->getBytesNoCopy();
++	msize = mdt->getLength();
++	memcpy(&phoff, m + 28, 4);
++	phnum = *(const uint16_t *)(m + 44);
++	for (uint32_t i = 0; i < phnum && phoff + 32 * (i + 1) <= msize; i++) {
++		const uint8_t *p = m + phoff + 32 * i;
++		uint32_t type, paddr, memsz, flags;
++		memcpy(&type, p, 4);
++		memcpy(&paddr, p + 12, 4);
++		memcpy(&memsz, p + 20, 4);
++		memcpy(&flags, p + 24, 4);
++		if (type == 1 && memsz != 0 && ((flags >> 24) & 7) != 2) {
++			lo = MIN(lo, paddr);
++			hi = MAX(hi, (paddr + memsz + 0xFFF) & ~0xFFFu);
++			load = i;
++		}
++	}
++	if (load == UINT32_MAX || hi - lo > ZAP_REGION_SIZE) {
++		LOG("  unexpected layout (load %u, %x..%x)", load, lo, hi);
++		goto out;
++	}
++	meta_md = dma_alloc((msize + 0xFFF) & ~0xFFFu, &meta_pa, &meta);
++	if (meta_md == NULL) {
++		LOG("  metadata alloc failed");
++		goto out;
++	}
++	memcpy(meta, m, msize);
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_SHUTDOWN), 1, GPU_PAS_ID, 0, 0, &res);
++	LOG("  shutdown: ret %llx res %llx", st, res);
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_INIT_IMAGE), 2 | (SCM_ARG_RW << 6), GPU_PAS_ID, meta_pa, 0, &res);
++	LOG("  init_image: ret %llx res %llx (meta %u bytes @%llx)", st, res, msize, meta_pa);
++	if (st != 0 || res != 0) {
++		st = scm(SCM_FN(SCM_SVC_BOOT, SCM_BOOT_SET_REMOTE_STATE), 2, 0, GPU_PAS_ID, 0, &res);
++		LOG("  set_remote_state(resume): ret %llx res %llx", st, res);
++		ok = st == 0 && res == 0;
++		goto out;
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_MEM_SETUP), 3, GPU_PAS_ID, ZAP_REGION, hi - lo, &res);
++	LOG("  mem_setup %llx+%x: ret %llx res %llx", ZAP_REGION, hi - lo, st, res);
++	{
++		volatile uint8_t *dst;
++		IOMemoryMap *zm = map_regs(ZAP_REGION, ZAP_REGION_SIZE, &dst);
++		uint32_t paddr;
++		if (zm == NULL) {
++			LOG("  map of the zap region failed");
++			goto out;
++		}
++		memcpy(&paddr, m + phoff + 32 * load + 12, 4);
++		for (uint32_t i = 0; i < ZAP_REGION_SIZE; i += 4) {
++			*(volatile uint32_t *)(dst + i) = 0;
++		}
++		uint32_t n = MIN((uint32_t)seg->getLength(), ZAP_REGION_SIZE - (paddr - lo));
++		const uint8_t *s = (const uint8_t *)seg->getBytesNoCopy();
++		for (uint32_t i = 0; i < n; i++) {
++			dst[paddr - lo + i] = s[i];
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		zm->release();
++	}
++	st = scm(SCM_FN(SCM_SVC_PIL, PIL_AUTH_RESET), 1, GPU_PAS_ID, 0, 0, &res);
++	LOG("  auth_and_reset: ret %llx res %llx (0/0 = TZ accepted the zap shader)", st, res);
++	ok = st == 0 && res == 0;
++out:
++	OSSafeReleaseNULL(mdt);
++	OSSafeReleaseNULL(seg);
++	return ok;
++}
++
++/* ---------------------------------------------------------------- SMMU and CP */
++
++static void
++smmu_fault(const char *tag)
++{
++	LOG("  [%s] SMMU gfsr %08x CB0 SCTLR %08x FSR %08x FAR %08x%08x FSYNR0 %08x", tag, rd(smmu, 0x48),
++	    rd(smmu, 0x8000), rd(smmu, 0x8058), rd(smmu, 0x8064), rd(smmu, 0x8060), rd(smmu, 0x8068));
++}
++
++/* CB0 (page 8 of 4 KB) pass-through, SMR0 = SID 0 mask 1 */
++static void
++smmu_identity(void)
++{
++	wr(smmu, 0x8058, 0xFFFFFFFF);
++	wr(smmu, 0x8020, 0);
++	wr(smmu, 0x8024, 0);
++	wr(smmu, 0x8030, 0);
++	wr(smmu, 0x8010, 0);
++	wr(smmu, 0x8038, 0);
++	wr(smmu, 0x803C, 0);
++	wr(smmu, 0x1000 + 0x800, 1);                    /* CBA2R0: VA64 */
++	wr(smmu, 0x1000, 0x0001f000);                   /* CBAR0 */
++	wr(smmu, 0x8000, 0xE0);                         /* SCTLR: M=0, fault report/irq */
++	wr(smmu, 0xC00, 0);                             /* S2CR0: via CB0 */
++	wr(smmu, 0x800, (1u << 31) | (1u << 16) | 0);   /* SMR0: SID 0 mask 1 */
++	LOG("  SMMU: SMR0 %08x S2CR0 %08x CBAR0 %08x CB0 SCTLR %08x", rd(smmu, 0x800), rd(smmu, 0xC00),
++	    rd(smmu, 0x1000), rd(smmu, 0x8000));
++}
++
++static inline uint32_t
++par(uint32_t v)
++{
++	return (0x9669 >> (0xF & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1;
++}
++
++static inline uint32_t
++pkt7(uint32_t op, uint32_t cnt)
++{
++	return 0x70000000u | cnt | (par(cnt) << 15) | ((op & 0x7F) << 16) | (par(op) << 23);
++}
++
++static inline void gwr(uint32_t reg, uint32_t v) { wr(gpu, 4 * reg, v); }
++static inline uint32_t grd(uint32_t reg) { return rd(gpu, 4 * reg); }
++static inline void gwr64(uint32_t reg, uint64_t v) { gwr(reg, (uint32_t)v); gwr(reg + 1, (uint32_t)(v >> 32)); }
++
++static inline void
++emit(uint32_t v)
++{
++	ring[wptr % RB_DWORDS] = v;
++	wptr++;
++}
++
++/* kick the ring and wait until the CP has consumed everything (RPTR == WPTR) */
++static bool
++submit(const char *what, uint32_t ms)
++{
++	uint32_t rptr = 0, w = wptr % RB_DWORDS;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gwr(0x807, w);                                  /* CP_RB_WPTR */
++	for (uint32_t i = 0; i < ms * 100; i++) {
++		rptr = grd(0x806);                          /* CP_RB_RPTR */
++		if (rptr == w) {
++			LOG("  %s: done (rptr %u) after ~%u us, RBBM_STATUS %08x", what, rptr, i * 10, grd(0x210));
++			return true;
++		}
++		IODelay(10);
++	}
++	LOG("  %s: TIMEOUT rptr %u wptr %u RBBM_STATUS %08x INT_0_STATUS %08x CP_HW_FAULT %08x", what, rptr, w,
++	    grd(0x210), grd(0x201), grd(0x821));
++	smmu_fault(what);
++	return false;
++}
++
++static void
++hw_init_regs(void)
++{
++	static const uint32_t addr_mode[] = { 0x842, 0xC01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0xE00,
++		                              0xae01, 0xb601, 0xF810 };
++
++	gwr(0x3c45, 0);                                 /* GBIF_HALT */
++	(void)grd(0x3c45);
++	gwr(0x16, 0);                                   /* RBBM_GBIF_HALT */
++	(void)grd(0x16);
++	gwr(0xF803, 0);                                 /* RBBM_SECVID_TSB_CNTL */
++	gwr64(0xF800, 0);
++	gwr(0xF802, 0);
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gwr(addr_mode[i], 1);                       /* 64-bit addressing */
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		gwr(0x3c03 + i, 0x00071620);                /* GBIF_QSB_SIDE0..3 (a610) */
++	}
++	gwr(0x11, 3);                                   /* RBBM_GBIF_CLIENT_QOS_CNTL */
++	gwr64(0xE05, 0x1fffffffff000ull + 0xfc0);       /* UCHE_WRITE_RANGE_MAX */
++	gwr64(0xE09, 0x1fffffffff000ull);               /* UCHE_TRAP_BASE */
++	gwr64(0xE07, 0x1fffffffff000ull);               /* UCHE_WRITE_THRU_BASE */
++	gwr64(0xE0B, 0x100000);                         /* UCHE_GMEM_RANGE_MIN */
++	gwr64(0xE0D, 0x100000 + 0x21000 - 1);           /* .._MAX: gmem 128K + 4K */
++	gwr(0xE18, 0x804);                              /* UCHE_FILTER_CNTL */
++	gwr(0xE17, 4);                                  /* UCHE_CACHE_WAYS */
++	gwr(0x8c2, 0x00800060);                         /* CP_ROQ_THRESHOLDS_2 */
++	gwr(0x8c1, 0x40201b16);                         /* CP_ROQ_THRESHOLDS_1 */
++	gwr(0x8C3, 48);                                 /* CP_MEM_POOL_SIZE */
++	gwr(0x9e00, 0x00080000);                        /* PC_DBG_ECO_CNTL */
++	gwr(0x98d, 1);                                  /* CP_AHB_CNTL */
++	gwr(0x1f, (1u << 30) | 0x3ffff);                /* RBBM_INTERFACE_HANG_INT_CNTL */
++	gwr(0xe19, 0x81);                               /* UCHE_CLIENT_PF */
++}
++
++static void
++cp_start(void)
++{
++	OSData *sqe = fw("sqe");
++	uint64_t sqe_pa, ring_pa, test_pa;
++	void *v;
++
++	LOG("--- CP start");
++	if (sqe == NULL || sqe->getLength() <= 4) {
++		LOG("  /arm-io/gpu sqe missing");
++		goto out;
++	}
++	sqe_md = dma_alloc((sqe->getLength() - 4 + 0xFFF) & ~0xFFFu, &sqe_pa, &v);
++	if (sqe_md != NULL) {
++		memcpy(v, (const uint8_t *)sqe->getBytesNoCopy() + 4, sqe->getLength() - 4);   /* minus its first dword */
++	}
++	ring_md = dma_alloc(RB_BYTES, &ring_pa, &v);
++	ring = (uint32_t *)v;
++	test_md = dma_alloc(0x4000, &test_pa, &v);
++	test = (uint32_t *)v;
++	if (sqe_md == NULL || ring_md == NULL || test_md == NULL) {
++		LOG("  DMA alloc failed");
++		goto out;
++	}
++	test[0] = 0x11111111;
++	LOG("  sqe %u bytes @%llx, ring @%llx, test @%llx", sqe->getLength() - 4, sqe_pa, ring_pa, test_pa);
++	smmu_identity();
++	hw_init_regs();
++	gwr64(0x830, sqe_pa);                           /* CP_SQE_INSTR_BASE */
++	gwr64(0x800, ring_pa);                          /* CP_RB_BASE */
++	gwr(0x802, 12 | (2 << 8) | (1u << 27));         /* CP_RB_CNTL: 32 KB, blk 32 B, NO_UPDATE */
++	wptr = 0;
++	gwr(0x807, 0);
++	gwr(0x808, 1);                                  /* CP_SQE_CNTL: start */
++	LOG("  SQE started: RBBM_STATUS %08x CP_HW_FAULT %08x rptr %u", grd(0x210), grd(0x821), grd(0x806));
++
++	emit(pkt7(CP_ME_INIT, 8));
++	emit(0x2f);
++	emit(3);
++	emit(0x20000000);
++	for (int i = 0; i < 5; i++) {
++		emit(0);
++	}
++	if (!submit("CP_ME_INIT", 100)) {
++		goto stop;
++	}
++	emit(pkt7(CP_SET_SECURE_MODE, 1));
++	emit(0);
++	if (!submit("CP_SET_SECURE_MODE 0", 100)) {
++		goto stop;
++	}
++	emit(pkt7(CP_MEM_WRITE, 3));
++	emit((uint32_t)test_pa);
++	emit((uint32_t)(test_pa >> 32));
++	emit(0xC0FFEE00);
++	submit("CP_MEM_WRITE", 100);
++	IODelay(100);
++	LOG("  test buffer: %08x %s", test[0], test[0] == 0xC0FFEE00 ? "*** THE GPU WROTE TO MEMORY ***" : "(not written)");
++	smmu_fault("after test");
++stop:
++	gwr(0x808, 0);                                  /* CP_SQE_CNTL: stop */
++out:
++	OSSafeReleaseNULL(sqe);
++}
++
++/* ---------------------------------------------------------------- the run */
++
++static void
++g1_thread(void *arg __unused, wait_result_t wr_ __unused)
++{
++	IOSleep(20000);
++	LOG("==== G1 (topaz-woa TopazGpu v0.6 port)");
++	gcc_map = map_regs(GCC_BASE, GCC_SIZE, &gcc);
++	gpucc_map = map_regs(GPUCC_BASE, GPUCC_SIZE, &gpucc);
++	if (gcc == NULL || gpucc == NULL) {
++		LOG("map failed: gcc %p gpucc %p", gcc, gpucc);
++		return;
++	}
++	if (power_up()) {
++		gpu_map = map_regs(GPU_BASE, GPU_SIZE, &gpu);
++		smmu_map = map_regs(SMMU_BASE, SMMU_SIZE, &smmu);
++		if (gpu != NULL && smmu != NULL) {
++			first_reads();
++			LOG("  GPU SMMU: sCR0 %08x ID0 %08x ID1 %08x", rd(smmu, 0x0), rd(smmu, 0x20), rd(smmu, 0x24));
++			if (zap_load()) {
++				cp_start();
++			} else {
++				LOG("  zap not loaded: the CP is not started");
++			}
++		}
++	} else {
++		LOG("  power-up FAILED");
++	}
++	power_down();
++	OSSafeReleaseNULL(sqe_md);
++	OSSafeReleaseNULL(ring_md);
++	OSSafeReleaseNULL(test_md);
++	OSSafeReleaseNULL(meta_md);
++	OSSafeReleaseNULL(gpu_map);
++	OSSafeReleaseNULL(smmu_map);
++	LOG("==== G1 over");
++}
++
++extern "C" void
++topaz_gpu_init(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("gpu_g1", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	if (kernel_thread_start(g1_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#else
++extern "C" void topaz_gpu_init(void) {}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 5365ac1..a8db384 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -11,6 +11,7 @@ iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitc
+ 
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/TopazModem.cpp                                  optional iokitcpp
++iokit/Kernel/arm/TopazGpu.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetBusy.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
