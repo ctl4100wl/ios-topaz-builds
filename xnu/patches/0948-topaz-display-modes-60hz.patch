@@ -128,4 +128,3 @@ After HackiOS MiniIOMobileFramebuffer publishModes() (APSL 2.0).
  		break;
  	case kSweetFBNotifications:
  		if (args->scalarInputCount >= 3 && args->scalarInput[2] < SWEET_FB_NOTIFY_TYPES) {
-

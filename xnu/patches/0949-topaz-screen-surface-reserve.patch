@@ -135,4 +135,3 @@ mapping or the GPU still holds it waits until they let go.
  				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
  				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, take,
  				    0x0000000FFFFFC000ull);
-
