@@ -1,3 +1,31 @@
+## Failed GPU startup investigation — 2026-10-22
+
+- User reported an hour without reaching SpringBoard and returned to OrangeFox.
+  Explicitly approved reading the reserved 4 MiB console-log region after the
+  prior automatic review rejection. The approved region was read successfully.
+- New local-only dump: boot-files/console-v3-0965.bin and .txt; header version 1,
+  total 92,191 bytes, flush sequence 18. The persisted log stops early in startup;
+  this does not by itself prove the whole system stopped at the exact last line.
+- Confirmed: GPU PAS/zap and command processor initialization succeed at 300 MHz;
+  RedwoodGPU is published. backboardd loads the bridge and creates an OpenGL ES
+  3.2 Mesa 25.0.7 context with renderer FD610. This establishes the hardware driver
+  and bridge initialized, not that frames rendered or reached the display.
+- SpringBoard launches (line 737). No SpringBoard/backboardd crash or kernel panic
+  is recorded. driverkitd has an unrelated SIGKILL record. Last lines: backboardd
+  creates 1125x2436 surface id 2, then IOSurface selector 9 (SetValue). No GPU
+  submissions are logged. Older working logs also pass this same IOSurface call,
+  so do not claim selector 9 is proven causal.
+- Built/validated gl=0 comparison image locally using unchanged 0965 kernel and
+  ADT: boot-files/shim-boot-3g-0965-gl0-diagnostic.img, SHA-256
+  5fc173c053cbd80cf32cb750a66af0170273cf0d2a725250ded6ce940e5cc9e5.
+  Keeps gpu=1 gpu_midmem=1 gpu_fbpool=0, disables the CoreAnimation GL bridge.
+  No userdata reflash. Recovery -> bootloader -> fastboot boot succeeded (exit 0,
+  0.725 s). Log research/logs/boot-v3-0965-gl0.log. User reports console visible,
+  waiting for programs to boot; lock/home screen outcome is still pending.
+- Next: confirm comparison UI outcome. If it boots, isolate bridge rendering path;
+  if still stuck, retrieve a new approved console-ring log and compare. Do not
+  assert a precise root cause from this truncated first log.
+
 ## Live deployment status — 2026-10-22
 
 - User explicitly authorized flashing v3 sparse userdata, then the GPU boot image.
