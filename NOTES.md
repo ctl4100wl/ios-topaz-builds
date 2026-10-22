@@ -1,3 +1,17 @@
+## User priority: restore GPU rendering — 2026-10-22
+
+- User says "I need GPU". Restore the full GPU-enabled 0965 boot, not the gl=0
+  diagnostic. Keep the installed v3 userdata; do not reflash/reset app databases.
+- User clarified current comparison boot is at Apple logo and fresh userdata
+  needs app-database/cache construction. Three minutes was insufficient to
+  classify that boot as stuck. The earlier GPU-hang attribution was overstated;
+  log cessation alone does not identify the cause. No recorded GPU panic.
+- Verified full GPU boot SHA-256 again: 1e2fd6a394df29d162a65ecdfd9aacb440e895b05916fc0faca21d5fce50c3e1.
+  Image boot-files/shim-boot-3g-0965-wifi-gpu.img has gpu=1 gpu_midmem=1
+  gpu_fbpool=0 and NO gl=0. Earlier log confirms FD610 context initialization.
+- Device currently exposes neither ADB nor fastboot. User was asked to manually
+  re-enter fastboot; await that confirmation before temporary GPU boot.
+
 ## Failed GPU startup investigation — 2026-10-22
 
 - User reported an hour without reaching SpringBoard and returned to OrangeFox.
