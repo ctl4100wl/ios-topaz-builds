@@ -1,3 +1,55 @@
+## WSL Wi-Fi/GPU work — 2026-10-22 (Codex)
+
+- User explicitly requested **local WSL builds**, no GitHub Actions. Inspected live
+  MakrSas/ios-topaz and oosexgang/hackios-xnu-{kernel,userland} READMEs with GitHub
+  connector, plus local kernel/userland sources. No CI run or push was made.
+- Claude's tail-only Wi-Fi diagnosis was incomplete: saved
+  `research/logs/wifi/wifi.txt` has initial mission mode, scans and successful
+  WPA2 joins at t=105254 ms and t=289301 ms. Network stats still show zero TX.
+  Later WLFW restarts loop at CAP error 119 / waiting FW_READY. SCM assign -2/0x56
+  also occurs on the first successful startup, so it is not proven causal.
+- Patch **0964**, in sibling `ios-topaz-fork/xnu/patches/`, targets fork edd815e
+  after upstream GPU series and 0960–0963. It invalidates station/scan/DMA state
+  on WLFW port replacement, rejects replies from the previous server, gates CE
+  polling on mission mode, resets endpoints, and reuses CE/HTT/WMI allocations.
+  It does not establish the first restart's cause or prove DHCP connectivity.
+- Built from a copy of `/home/ctl4100wl/xbuild/xnu` in `/tmp/topaz-wifi-xnu`:
+  `XNU_SRC=/tmp/topaz-wifi-xnu bash /home/ctl4100wl/xbuild/xnu-build.sh -j4 build`.
+  Exit 0; kernel linked with no undefined symbols. Default `all` additionally
+  failed optional kext symbolset export checks; `build` is the successful kernel
+  target. Logs under `ios-topaz/research/logs/kernel-wifi-0964*.log`.
+- Final kernel includes **0965**: fixed GPU pool disabled when gpu_midmem=1.
+  The 0x90000000..0xd0000000 pool overlaps XNU's managed memory in this ADT.
+  Final kernel `ios-topaz/xnu/out-0965/kernel.development.sweet`.
+  Boot image `boot-files/shim-boot-3g-0965-wifi-gpu.img`, SHA-256
+  1e2fd6a394df29d162a65ecdfd9aacb440e895b05916fc0faca21d5fce50c3e1.
+  Final local `build` target also passed after 0965; no undefined kernel symbols.
+  Boot-v4/payload/ADT checks and executable ARMv8.0 instruction scan pass.
+  Uses existing 3 GiB ADT: base 0x82000000, size 0xbe000000; gpu=1 modem=1 wifi=1
+  modem_pool=0x80000000, cpus=4, sweetfb_hz=60, sweetfb_noconsole=1,
+  **gpu_midmem=1 gpu_fbpool=0**. Do not use gpu=1 without these on the 3 GiB ADT.
+- v3 raw userdata image is a COPY of the saved v2 base, not current phone data.
+  `tools/stage-gpu-root.py` installs previously WSL-built/signed Freedreno Mesa,
+  libtopaz-gl/inject and a backboardd wrapper, preserving stock executable at
+  `/usr/libexec/real/backboardd`. Hardware renderer is not yet device-verified.
+- Compiled/signed hackios `userland/src/net_test.m` in WSL with Cortex-A53 flags;
+  added boot job `com.topaz.wifi` (also in consolidated launchd cache): `wifi watch
+  180`; logs `/var/mobile/topaz-logs/wifi.log`. It leaves an existing configd
+  service alone and requests DHCP only if no service exists. A fallback service
+  alone may not give wifid a check mark; diagnostics are needed.
+- Filesystem guest ran with QEMU TCG (sandbox has no /dev/kvm). Use the guest's
+  musl loader + busybox for mount/umount: host mount is setuid to uid 65534 in
+  this sandbox. `research/guest/job-v3-gpu.sh` and `run-v3-gpu.sh` retain recipe.
+  Guest exit 0, HFS+ check after install clean, boot-critical root checks pass.
+- Raw output `boot-files/ios16-root-v3-gpu.img`; Android sparse packaging started,
+  followed by required independent expansion/hash verification before flashing.
+- No phone partitions written or temporary boot attempted. Phone was seen in
+  recovery. Fresh raw console-ring pull was rejected by automatic approval
+  review as potentially containing userdata outside logs. Do NOT work around it:
+  obtain user approval specifically for that raw reserved-region read first.
+- Flashing userdata needs explicit confirmation under AGENTS.md: v3 replaces
+  current iOS data. Do not flash merely because the user requested a build.
+
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 ## Agent handoff / active work (2026-10-15, latest)

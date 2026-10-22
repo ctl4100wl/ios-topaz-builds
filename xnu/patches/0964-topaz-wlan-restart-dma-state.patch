@@ -1,0 +1,189 @@
+From: Codex <codex@openai.com>
+Subject: [PATCH] topaz: reset WLAN DMA and station state when WLFW restarts
+
+A replacement WLFW port invalidates the old CE, HTC, WMI and HTT session.
+Stop polling the radio before mission mode, drop link/scan/join state and
+reject delayed replies from the previous server. Reuse CE/HTT/WMI host
+allocations rather than exhausting the fixed 16 MiB pool on recovery.
+
+Based on local fork edd815e (upstream GPU series plus patches 0960-0963).
+Built on WSL; no device test yet. This addresses restart handling; it does
+not establish why the first firmware restart happened or prove DHCP works.
+
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -427,6 +427,7 @@
+ static void svc_announce(void);
+ static void svc_summary(void);
+ static void wlfw_arrive(uint32_t node, uint32_t port);
++static void radio_restart(void);
+ static bool wifi_enabled(void);
+ static bool ce_start(void);
+ static void radio_poll(unsigned ms);
+@@ -3308,6 +3309,7 @@
+ 	if (w_arrivals++ != 0) {
+ 		/* the WLAN PD restarted (new server port): start the handshake again */
+ 		LOG("t=%u ms: WLFW back on port %x (restart %u, last step: %s): handshake again", g_ms, port, w_arrivals - 1, w_step);
++		radio_restart();
+ 		w_msa_ind = w_cap_done = w_bdf_started = w_fw_ready = w_mission = false;
+ 		w_board = 0xFF;
+ 		w_cap_tries = 0;
+@@ -3620,6 +3622,8 @@
+ static volatile uint32_t *ce_rri;
+ static uint64_t ce_rri_pa;
+ static bool ce_up;
++static uint8_t *ce_block;
++static uint64_t ce_block_pa;
+ 
+ static bool ce_host_rx(uint32_t c) { return ce_attr[c].dst_n != 0 && c != 7; }
+ static bool ce_host_tx(uint32_t c) { return c == 0 || c == 3 || c == 4; }
+@@ -3647,8 +3651,10 @@
+ 	if (ce_up) {
+ 		return true;
+ 	}
+-	ce_regs = (volatile uint8_t *)ml_io_map(CE_PA, (CE_COUNT + 1) * 0x1000);
+-	ce_shadow = (volatile uint8_t *)ml_io_map(SHADOW_PA, 0x1000);
++	if (ce_regs == NULL) {
++		ce_regs = (volatile uint8_t *)ml_io_map(CE_PA, (CE_COUNT + 1) * 0x1000);
++		ce_shadow = (volatile uint8_t *)ml_io_map(SHADOW_PA, 0x1000);
++	}
+ 	for (uint32_t c = 0; c < CE_COUNT; c++) {
+ 		ce[c].src_n = ce_attr[c].src_n ? pow2(ce_attr[c].src_n) : 0;
+ 		ce[c].dst_n = ce_attr[c].dst_n ? pow2(ce_attr[c].dst_n) : 0;
+@@ -3657,11 +3663,16 @@
+ 		off += ce_host_rx(c) ? RX_POST * RX_BUF_SIZE : 0;
+ 		off += ce_host_tx(c) ? ce_tx_slots(c) * ce_tx_sz(c) : 0;
+ 	}
+-	uint8_t *va = (uint8_t *)pool_alloc(off, &pa);
++	if (ce_block == NULL) {
++		ce_block = (uint8_t *)pool_alloc(off, &ce_block_pa);
++	}
++	uint8_t *va = ce_block;
++	pa = ce_block_pa;
+ 	if (ce_regs == NULL || ce_shadow == NULL || va == NULL) {
+ 		LOG("ce: map/alloc failed (%llu bytes)", off);
+ 		return false;
+ 	}
++	bzero(va, off);
+ 	LOG("ce: host memory %llx + %llx", pa, off);
+ 	ce_rri = (volatile uint32_t *)va;
+ 	ce_rri_pa = pa;
+@@ -4011,6 +4022,8 @@
+ static struct wmi_mem_req wmi_req[MAX_MEM_REQS];
+ static uint64_t wmi_chunk_pa[MAX_MEM_REQS];
+ static uint32_t wmi_chunk_len[MAX_MEM_REQS];
++static uint64_t wmi_host_pa;
++static uint32_t wmi_host_size;
+ static bool wmi_init_sent, wmi_ready, wmi_seen_bmap, wmi_seen_reqs;
+ static uint8_t wmi_mac[6];
+ 
+@@ -4113,7 +4126,13 @@
+ 		wmi_chunk_len[i] = units * ((wmi_req[i].unit_size + 3) & ~3u);
+ 		total += (wmi_chunk_len[i] + 0xfff) & ~0xfffu;
+ 	}
+-	if (total != 0 && (total > MAX_MEM_TOTAL || pool_alloc(total, &pa) == NULL)) {
++	if (total != 0 && wmi_host_pa == 0 && total <= MAX_MEM_TOTAL) {
++		if (pool_alloc(total, &wmi_host_pa) != NULL) {
++			wmi_host_size = total;
++		}
++	}
++	pa = wmi_host_pa;
++	if (total != 0 && (pa == 0 || total > wmi_host_size)) {
+ 		LOG("wmi: host memory %u bytes not given", total);
+ 		n = 0;
+ 	}
+@@ -4396,12 +4415,16 @@
+ 	if (htt_state != 0) {
+ 		return;
+ 	}
+-	htt_blk = (uint8_t *)pool_alloc(ring + bank + HTT_RING_SIZE * HTT_BUF_SIZE, &pa);
++	if (htt_blk == NULL) {
++		htt_blk = (uint8_t *)pool_alloc(ring + bank + HTT_RING_SIZE * HTT_BUF_SIZE, &htt_ring_pa);
++	}
++	pa = htt_ring_pa;
+ 	if (htt_blk == NULL) {
+ 		LOG("htt: no memory, scanning without it");
+ 		scan_start();
+ 		return;
+ 	}
++	bzero(htt_blk, ring + bank + HTT_RING_SIZE * HTT_BUF_SIZE);
+ 	htt_ring = (volatile uint64_t *)htt_blk;
+ 	htt_ring_pa = pa;
+ 	htt_idx = (volatile uint32_t *)(htt_blk + HTT_RING_SIZE * 8);
+@@ -5912,6 +5935,48 @@
+ 	}
+ }
+ 
++/* A new WLFW port invalidates every DMA ring and firmware endpoint. No MMIO here:
++ * the WLAN bus is unsafe until the replacement firmware is in mission mode. */
++static void
++radio_restart(void)
++{
++	api_ready = false;
++	ce_up = false;
++	w_mission = false;
++	if (s_state == S_UP) {
++		w_link(false);
++	}
++	s_state = S_IDLE;
++	s_result = ECONNRESET;
++	s_join_asked = s_leave_asked = false;
++	s_join_done++;
++	s_ptk_set = s_start_resp = false;
++	bzero(s_pmk, sizeof(s_pmk));
++	bzero(s_ptk, sizeof(s_ptk));
++	tx_busy = 0;
++	if (etxq_lock != NULL) {
++		IOSimpleLockLock(etxq_lock);
++		etxq_head = etxq_tail;
++		IOSimpleLockUnlock(etxq_lock);
++	}
++	api_scan_asked = false;
++	api_scans_done++;
++	scan_started = scanning = false;
++	next_scan_ms = 0;
++	nbss = scans = scan_frames = 0;
++	htc_ready = htc_setup = false;
++	bzero(ep, sizeof(ep));
++	wmi_eid = htt_eid = 0xFF;
++	wmiq_head = wmiq_tail = 0;
++	wmi_init_sent = wmi_ready = wmi_seen_bmap = wmi_seen_reqs = false;
++	wmi_nreq = 0;
++	bzero(wmi_svc_map, sizeof(wmi_svc_map));
++	bzero(wmi_svc_ext, sizeof(wmi_svc_ext));
++	htt_state = htt_alloc = 0;
++	bzero(ce, sizeof(ce));
++	LOG("wlan: firmware restarted; link down, stale DMA and scan state discarded");
++}
++
+ /* from the watch loop */
+ static void
+ radio_poll(unsigned ms)
+@@ -5921,7 +5986,7 @@
+ 		w_cap_retry_ms = 0;
+ 		w_simple(WLFW_CAP, "cap sent again");
+ 	}
+-	if (!ce_up) {
++	if (!w_mission || !ce_up) {
+ 		return;
+ 	}
+ 	(void)ce_poll();
+@@ -5932,7 +5997,7 @@
+ 		}
+ 		api_ready = true;
+ 		LOG("t=%u ms: wlan: radio ready for the rest of the kernel", g_ms);
+-		if (topaz_wlan_ready_hook != NULL) {
++		if (topaz_wlan_ready_hook != NULL && topaz_wlan_rx_hook == NULL) {
+ 			topaz_wlan_ready_hook();
+ 		}
+ 	}
+@@ -5980,6 +6045,9 @@
+ 		return true;
+ 	}
+ 	if (dst_port == PORT_WLFWC) {
++		if (src_node != w_node || src_port != w_port) {
++			return true;
++		}
+ 		wlfw_rx(data, len);
+ 		return true;
+ 	}
