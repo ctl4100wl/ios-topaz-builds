@@ -1,3 +1,26 @@
+## USB blocks requested GPU restoration — 2026-10-22
+
+- User repeatedly authorized loading the full GPU image; userdata remains v3 and
+  must not be reflashed. User explicitly does NOT want a PC reboot.
+- GPU boot retry log research/logs/boot-v3-gpu-0965-usb-retry.log: transfer FAILED
+  with Windows AdbWriteEndpointSync semaphore timeout 121. No Booting OKAY.
+- Windows alternates between USB descriptor failure (Code 43, usb.inf placeholder)
+  and Android Bootloader Interface. When identified, driver is Google oem73.inf,
+  WinUSB, version 11.0.0.0, problem code 0. Fastboot 37.0.1 sometimes lists an
+  unreadable serial. Do not claim an incorrect Android driver is proven.
+- Unprivileged PnP rescan got Windows Access denied (not a sandbox rejection).
+  A UAC-elevated, device-specific restart was then prepared under research/tmp.
+  Verified target identity before restart. Initial unknown-device target vanished,
+  so that attempt made no change. Second attempt targeted the identified phone:
+  pnputil /restart-device and /scan-devices both exited 0. No USB host controllers
+  were reset and no drivers uninstalled. Log research/logs/reset-phone-bootloader.log.
+- After restart, device again became Unknown USB Device / Descriptor Request Failed.
+  User was asked to restart ONLY the phone into FASTBOOT, then reconnect USB;
+  PC stays running. Await confirmation, recheck enumeration, then retry GPU boot.
+- Full GPU artifact remains boot-files/shim-boot-3g-0965-wifi-gpu.img. Do not use
+  the gl=0 diagnostic; user explicitly prioritizes GPU. Let app database initialize
+  after boot and do not infer a hang solely from an early persisted log ending.
+
 ## User priority: restore GPU rendering — 2026-10-22
 
 - User says "I need GPU". Restore the full GPU-enabled 0965 boot, not the gl=0
