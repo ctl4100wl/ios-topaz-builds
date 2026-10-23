@@ -1,0 +1,28 @@
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+index e65bff9..d1d9e9a 100644
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -43,8 +43,12 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define MDT_TYPE_HASH       (2u << 24)
+ #define MDT_RELOCATABLE     (1u << 27)
+ 
+-/* middle DDR bank, RAM the kernel does not manage; below 0xF0000000 for TZ/the modem */
+-#define MODEM_POOL_BASE     0xE0000000ull
++/*
++ * RAM the kernel does not manage, below 0xF0000000 for TZ/the modem. Boot-arg modem_pool=
++ * moves it: the 3 GB layout (kernel at 0x82000000) gives the pool 0x80000000.
++ */
++static uint64_t modem_pool_base = 0xE0000000ull;
++#define MODEM_POOL_BASE     modem_pool_base
+ #define MODEM_POOL_SIZE     0x01000000ull       /* 16 MB: metadata, SCM args, rmtfs, CE rings, WMI memory */
+ 
+ #define SMEM_PA             0x46000000ull
+@@ -6274,6 +6278,8 @@ topaz_soc_map(void)
+ 	state = -1;
+ 	soc_lock = IOLockAlloc();
+ 	(void)PE_parse_boot_argn("modem_part", fw_part, sizeof(fw_part));
++	(void)PE_parse_boot_argn("modem_pool", &modem_pool_base, sizeof(modem_pool_base));
++	LOG("pool %llx + %llx", modem_pool_base, MODEM_POOL_SIZE);
+ 	uint8_t probe[16];
+ 	int err = EAGAIN;
+ 	for (int i = 0; i < 120 && err == EAGAIN; i++) {
