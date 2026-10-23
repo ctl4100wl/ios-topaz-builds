@@ -1,0 +1,107 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -472,13 +472,70 @@
+ 	return err;
+ }
+ 
++/*
++ * topaz: replacement panels carry a Samsung FT3519T (same 54:52 id, fw 0x32)
++ * on which every report poll failed with EIO. Say why, at most once a second.
++ */
++static void
++touch_ft_note(const char *why, int err, const uint8_t *buf)
++{
++	static uint64_t last;
++	uint64_t now = mach_absolute_time(), gap;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &gap);
++	if (now - last < gap) {
++		return;
++	}
++	last = now;
++	printf("SWEET TOUCH: ft %s err=%d got=%u irq=%#x raw %02x %02x %02x | %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++	    why, err, st.got, st.irq_status, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
++	    buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]);
++}
++
++/*
++ * The whole 63-byte report (registers 0x00..0x3e) in one read; if that fails,
++ * the 3-byte header and then one 6-byte read per record, like the short
++ * reads that work during the probe.
++ */
++static int
++touch_ft_frame(uint8_t *buf)
++{
++	memset(buf, 0xa5, 63);
++	int err = touch_read(0x38, 0, false, buf, 63);
++	if (!err) {
++		return 0;
++	}
++	touch_ft_note("full read", err, buf);
++	memset(buf, 0xff, 63);
++	err = touch_read(0x38, 0, false, buf, 3);
++	if (err) {
++		touch_ft_note("header read", err, buf);
++		return err;
++	}
++	unsigned n = buf[2] & 15u;
++	if (n == 0 || n > TOUCH_MAX) {
++		return 0;       /* no contact: the records stay 0xff */
++	}
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		uint8_t *p = buf + 3u + 6u * i;
++		err = touch_read(0x38, (uint16_t)(3u + 6u * i), false, p, 6);
++		if (err) {
++			touch_ft_note("record read", err, buf);
++			return err;
++		}
++		if ((p[2] >> 4) >= TOUCH_MAX) {
++			break;
++		}
++	}
++	return 0;
++}
++
+ static int
+ touch_focaltech(void)
+ {
+ 	uint8_t buf[63];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
++	int err = touch_ft_frame(buf);
+ 	if (err) {
+ 		return err;
+ 	}
+@@ -510,7 +567,9 @@
+ 			    n, buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+ 			    buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
+ 		}
+-		return EIO;
++		/* topaz FT3519T: a count > 10 is "release all" here too (TopazTouch) */
++		touch_report(0, x, y);
++		return 0;
+ 	}
+ 	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+ 		const uint8_t *p = buf + 3u + 6u * i;
+@@ -519,7 +578,9 @@
+ 			break; /* vendor's unused-record sentinel */
+ 		}
+ 		if (seen & (1u << id)) {
+-			return EIO;
++			/* topaz FT3519T: idle/stale slots repeat an id; end of the records */
++			touch_ft_note("repeated id", 0, buf);
++			break;
+ 		}
+ 		seen |= 1u << id;
+ 		if (event == 1u) {
+@@ -532,7 +593,8 @@
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+ 		/* topaz: raw 0..1349 x 0..2999 (1.25x the panel) + 2-bit fractions */
+ 		if (px > 1349 || py > 2999) {
+-			return EIO;
++			touch_ft_note("out of range", 0, buf);
++			continue;       /* topaz FT3519T: drop the record, keep the rest */
+ 		}
+ 		px = (px * 4u + (p[4] >> 6)) / 5u;
+ 		py = (py * 4u + ((p[4] >> 4) & 3u)) / 5u;

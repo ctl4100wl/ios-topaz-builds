@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -492,21 +492,24 @@
+ }
+ 
+ /*
+- * The whole 63-byte report (registers 0x00..0x3e) in one read; if that fails,
+- * the 3-byte header and then one 6-byte read per record, like the short
+- * reads that work during the probe.
++ * The report (registers 0x01..0x3e, at buf[1..62]) in one read; if that
++ * fails, the header and then one 6-byte read per record, like the short reads
++ * that work during the probe. topaz FT3519T: a read that starts at register
++ * 0x00 returns only zeros; the vendor driver (Focaltech V3.4) starts at 0x01.
+  */
+ static int
+ touch_ft_frame(uint8_t *buf)
+ {
+ 	memset(buf, 0xa5, 63);
+-	int err = touch_read(0x38, 0, false, buf, 63);
++	buf[0] = 0;
++	int err = touch_read(0x38, 1, false, buf + 1, 62);
+ 	if (!err) {
+ 		return 0;
+ 	}
+ 	touch_ft_note("full read", err, buf);
+ 	memset(buf, 0xff, 63);
+-	err = touch_read(0x38, 0, false, buf, 3);
++	buf[0] = 0;
++	err = touch_read(0x38, 1, false, buf + 1, 2);
+ 	if (err) {
+ 		touch_ft_note("header read", err, buf);
+ 		return err;
