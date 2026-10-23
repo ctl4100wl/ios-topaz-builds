@@ -1,0 +1,22 @@
+Subject: [PATCH] topaz: never allocate from the unmanaged GPU pool in midmem mode
+
+The fixed GPU pool 0x90000000..0xd0000000 overlaps the 3 GiB ADT's
+XNU-managed bank 0x82000000..0x140000000. With gpu_midmem=1 all GPU
+buffers must use the existing IOKit allocation paths; an allocation failure
+must not fall back to this fixed pool. Use gpu_fbpool=0 for display buffers.
+
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -245,6 +245,12 @@
+ {
+ 	uint64_t pa;
+ 
++	/* --midmem gives this bank to XNU. A fixed physical pool would alias live
++	 * kernel pages; callers must use their IOKit allocation path or fail. */
++	if (gpu_midmem != 0) {
++		return 0;
++	}
++
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+ 	if (size > GPU_POOL_CHUNK - GPU_POOL_UNIT) {
+ 		return 0;
